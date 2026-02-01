@@ -351,9 +351,84 @@ agent := vega.Agent{
 }
 ```
 
+### Conversation History
+
+Vega provides flexible ways to manage conversation context across sessions.
+
+#### Resume Conversations with `WithMessages`
+
+Spawn a process with pre-existing conversation history:
+
+```go
+// Load previous conversation (from database, file, etc.)
+history := []vega.Message{
+    {Role: vega.RoleUser, Content: "What's our project deadline?"},
+    {Role: vega.RoleAssistant, Content: "The deadline is March 15th."},
+}
+
+// Spawn with existing history - the agent remembers the conversation
+proc, err := orch.Spawn(agent, vega.WithMessages(history))
+if err != nil {
+    log.Fatal(err)
+}
+
+// Continue the conversation naturally
+response, _ := proc.Send(ctx, "Can we extend it by a week?")
+// Agent knows "it" refers to the March 15th deadline
+```
+
+#### Serialize Messages for Persistence
+
+Save and restore conversations using JSON:
+
+```go
+// Save conversation to database/file
+messages := []vega.Message{
+    {Role: vega.RoleUser, Content: "Hello"},
+    {Role: vega.RoleAssistant, Content: "Hi there!"},
+}
+data, err := vega.MarshalMessages(messages)
+// Store `data` in your database
+
+// Later, restore the conversation
+restored, err := vega.UnmarshalMessages(data)
+proc, err := orch.Spawn(agent, vega.WithMessages(restored))
+```
+
+#### Token-Aware Context with `TokenBudgetContext`
+
+Automatically manage context within a token budget:
+
+```go
+// Create context with 8000 token budget (~32k chars)
+ctx := vega.NewTokenBudgetContext(8000)
+
+// Optionally load existing history
+ctx.Load(previousMessages)
+
+agent := vega.Agent{
+    Name:    "assistant",
+    Context: ctx, // Attach to agent
+}
+
+// As conversation grows, oldest messages are automatically trimmed
+// to stay within the 8000 token budget
+
+// Save for later
+snapshot := ctx.Snapshot()
+data, _ := vega.MarshalMessages(snapshot)
+```
+
+`TokenBudgetContext` features:
+- Automatic trimming of oldest messages when budget exceeded
+- Token estimation (~4 chars per token)
+- `Load()` to restore from persistence
+- `Snapshot()` to get messages for saving
+- Thread-safe for concurrent use
+
 ### Context Auto-Compaction
 
-Manage long conversations with automatic summarization:
+For smarter context management with LLM-powered summarization:
 
 ```go
 // Create a sliding window context that keeps recent messages
@@ -376,6 +451,13 @@ The `SlidingWindowContext` automatically:
 - Can summarize older messages using the LLM
 - Preserves important context while reducing token usage
 
+**When to use which:**
+| Context Manager | Best For |
+|-----------------|----------|
+| `WithMessages` only | Simple resume, short conversations |
+| `TokenBudgetContext` | Long conversations, automatic trimming, persistence |
+| `SlidingWindowContext` | Very long conversations needing intelligent summarization |
+
 ### Budget Control
 
 ```go
@@ -384,6 +466,58 @@ agent := vega.Agent{
         Limit:    5.0,           // $5.00 max
         OnExceed: vega.BudgetBlock,
     },
+}
+```
+
+### Spawn Tree Tracking
+
+Track parent-child relationships when agents spawn other agents:
+
+```go
+// When spawning from a parent process, use WithParent to establish the relationship
+childProc, err := orch.Spawn(childAgent,
+    vega.WithParent(parentProc),           // Track parent-child relationship
+    vega.WithSpawnReason("Process data"),  // Optional context for the spawn
+)
+
+// The child process will have:
+// - ParentID: parent's process ID
+// - ParentAgent: parent's agent name
+// - SpawnDepth: parent's depth + 1
+
+// Query the entire spawn tree
+tree := orch.GetSpawnTree()
+// Returns []*SpawnTreeNode with hierarchical structure
+```
+
+For tools that spawn processes, the parent process is automatically available via context:
+
+```go
+func mySpawnTool(ctx context.Context, params map[string]any) (string, error) {
+    // Get the calling process from context
+    parent := vega.ProcessFromContext(ctx)
+
+    // Spawn with parent tracking
+    child, err := orch.Spawn(agent,
+        vega.WithParent(parent),
+        vega.WithSpawnReason(params["task"].(string)),
+    )
+    // ...
+}
+```
+
+The spawn tree structure:
+
+```go
+type SpawnTreeNode struct {
+    ProcessID   string           `json:"process_id"`
+    AgentName   string           `json:"agent_name"`
+    Task        string           `json:"task"`
+    Status      Status           `json:"status"`
+    SpawnDepth  int              `json:"spawn_depth"`
+    SpawnReason string           `json:"spawn_reason,omitempty"`
+    StartedAt   time.Time        `json:"started_at"`
+    Children    []*SpawnTreeNode `json:"children,omitempty"`
 }
 ```
 
@@ -739,6 +873,7 @@ const (
 | Cost tracking | Manual | Partial | ✅ Built-in |
 | MCP server support | Manual | Partial | ✅ Built-in |
 | Dynamic skills | ❌ | ❌ | ✅ Built-in |
+| Conversation history | Manual | Manual | ✅ WithMessages, persistence helpers |
 | Context compaction | ❌ | ❌ | ✅ Auto-summarization |
 | Structured logging | Manual | Partial | ✅ slog integration |
 | Error classification | ❌ | ❌ | ✅ 7 error classes |
@@ -753,8 +888,9 @@ const (
 ```
 vega/
 ├── agent.go           # Agent definition, context managers, defaults
-├── process.go         # Running process with lifecycle, retry logic
-├── orchestrator.go    # Process management, callbacks, groups
+├── context.go         # TokenBudgetContext, message serialization
+├── process.go         # Running process with lifecycle, retry logic, spawn tree tracking
+├── orchestrator.go    # Process management, spawn options, groups
 ├── supervision.go     # Fault tolerance, health monitoring
 ├── tools.go           # Tool registration, HTTP/exec executors
 ├── mcp_tools.go       # MCP server integration

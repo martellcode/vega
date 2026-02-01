@@ -10,6 +10,23 @@ import (
 	"time"
 )
 
+// contextKey is a type for context keys used by vega.
+type contextKey string
+
+// processContextKey is the context key for the current process.
+const processContextKey contextKey = "vega.process"
+
+// ContextWithProcess returns a new context with the process attached.
+func ContextWithProcess(ctx context.Context, p *Process) context.Context {
+	return context.WithValue(ctx, processContextKey, p)
+}
+
+// ProcessFromContext retrieves the process from the context, if present.
+func ProcessFromContext(ctx context.Context) *Process {
+	p, _ := ctx.Value(processContextKey).(*Process)
+	return p
+}
+
 // Process is a running Agent with state and lifecycle.
 type Process struct {
 	// ID is the unique identifier for this process
@@ -86,6 +103,14 @@ type Process struct {
 
 	// Process group membership
 	groups map[string]*ProcessGroup
+
+	// Spawn tree tracking
+	ParentID    string   // ID of spawning process (empty if root)
+	ParentAgent string   // Agent name of parent
+	ChildIDs    []string // Child process IDs
+	childMu     sync.RWMutex
+	SpawnDepth  int    // Depth in tree (0 = root)
+	SpawnReason string // Task/context for spawn
 }
 
 // Status represents the process lifecycle state.
@@ -490,10 +515,13 @@ func (p *Process) executeLLMLoop(ctx context.Context, message string) (string, C
 		// Execute tool calls
 		messages = append(messages, Message{Role: RoleAssistant, Content: resp.Content})
 
+		// Create context with process for tool execution
+		toolCtx := ContextWithProcess(ctx, p)
+
 		for _, tc := range resp.ToolCalls {
 			metrics.ToolCalls = append(metrics.ToolCalls, tc.Name)
 
-			result, err := p.Agent.Tools.Execute(ctx, tc.Name, tc.Arguments)
+			result, err := p.Agent.Tools.Execute(toolCtx, tc.Name, tc.Arguments)
 			if err != nil {
 				result = "Error: " + err.Error()
 			}
@@ -597,13 +625,16 @@ func (p *Process) executeLLMStream(ctx context.Context, message string, chunks c
 		}
 		messages = append(messages, Message{Role: RoleAssistant, Content: assistantContent})
 
+		// Create context with process for tool execution
+		toolCtx := ContextWithProcess(ctx, p)
+
 		// Execute tool calls and add results
 		for _, tc := range toolCalls {
 			p.mu.Lock()
 			p.metrics.ToolCalls++
 			p.mu.Unlock()
 
-			result, err := p.Agent.Tools.Execute(ctx, tc.Name, tc.Arguments)
+			result, err := p.Agent.Tools.Execute(toolCtx, tc.Name, tc.Arguments)
 			if err != nil {
 				result = "Error: " + err.Error()
 			}

@@ -247,6 +247,45 @@ func WithProject(name string) SpawnOption {
 	}
 }
 
+// WithMessages initializes the process with existing conversation history.
+// This is useful for resuming conversations or providing context from previous interactions.
+func WithMessages(messages []Message) SpawnOption {
+	return func(p *Process) {
+		p.mu.Lock()
+		p.messages = make([]Message, len(messages))
+		copy(p.messages, messages)
+		p.mu.Unlock()
+	}
+}
+
+// WithParent sets the parent process for spawn tree tracking.
+// This establishes the parent-child relationship for visualization.
+func WithParent(parent *Process) SpawnOption {
+	return func(p *Process) {
+		if parent == nil {
+			return
+		}
+		p.ParentID = parent.ID
+		if parent.Agent != nil {
+			p.ParentAgent = parent.Agent.Name
+		}
+		p.SpawnDepth = parent.SpawnDepth + 1
+
+		// Add this process to parent's children list
+		parent.childMu.Lock()
+		parent.ChildIDs = append(parent.ChildIDs, p.ID)
+		parent.childMu.Unlock()
+	}
+}
+
+// WithSpawnReason sets the reason/task for spawning this process.
+// This provides context for why the process was created.
+func WithSpawnReason(reason string) SpawnOption {
+	return func(p *Process) {
+		p.SpawnReason = reason
+	}
+}
+
 // Spawn creates and starts a new process from an agent.
 func (o *Orchestrator) Spawn(agent Agent, opts ...SpawnOption) (*Process, error) {
 	// Validate agent
@@ -1762,4 +1801,62 @@ func (o *Orchestrator) BroadcastToGroup(ctx context.Context, groupName, message 
 	}
 
 	return group.Broadcast(ctx, message), nil
+}
+
+// --- Spawn Tree ---
+
+// SpawnTreeNode represents a node in the process spawn tree.
+type SpawnTreeNode struct {
+	ProcessID   string           `json:"process_id"`
+	AgentName   string           `json:"agent_name"`
+	Task        string           `json:"task"`
+	Status      Status           `json:"status"`
+	SpawnDepth  int              `json:"spawn_depth"`
+	SpawnReason string           `json:"spawn_reason,omitempty"`
+	StartedAt   time.Time        `json:"started_at"`
+	Children    []*SpawnTreeNode `json:"children,omitempty"`
+}
+
+// GetSpawnTree returns the hierarchical spawn tree of all processes.
+// Root processes (those with no parent) are returned as top-level nodes.
+func (o *Orchestrator) GetSpawnTree() []*SpawnTreeNode {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	// Build a map of process ID to node
+	nodeMap := make(map[string]*SpawnTreeNode)
+	for _, p := range o.processes {
+		agentName := ""
+		if p.Agent != nil {
+			agentName = p.Agent.Name
+		}
+		nodeMap[p.ID] = &SpawnTreeNode{
+			ProcessID:   p.ID,
+			AgentName:   agentName,
+			Task:        p.Task,
+			Status:      p.Status(),
+			SpawnDepth:  p.SpawnDepth,
+			SpawnReason: p.SpawnReason,
+			StartedAt:   p.StartedAt,
+			Children:    make([]*SpawnTreeNode, 0),
+		}
+	}
+
+	// Build the tree by connecting children to parents
+	var roots []*SpawnTreeNode
+	for _, p := range o.processes {
+		node := nodeMap[p.ID]
+		if p.ParentID == "" {
+			// Root node
+			roots = append(roots, node)
+		} else if parent, ok := nodeMap[p.ParentID]; ok {
+			// Connect to parent
+			parent.Children = append(parent.Children, node)
+		} else {
+			// Parent not found (may have been cleaned up), treat as root
+			roots = append(roots, node)
+		}
+	}
+
+	return roots
 }

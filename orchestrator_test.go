@@ -720,3 +720,96 @@ func TestAutomaticRestartWithSupervision(t *testing.T) {
 		t.Error("OnRestart callback should have been called")
 	}
 }
+
+// --- WithMessages Tests ---
+
+func TestWithMessages(t *testing.T) {
+	llm := &mockLLM{response: "I remember that!"}
+	o := NewOrchestrator(WithLLM(llm))
+
+	agent := Agent{
+		Name:   "test-agent",
+		System: StaticPrompt("You are a helpful assistant."),
+	}
+
+	// Spawn with existing conversation history
+	history := []Message{
+		{Role: RoleUser, Content: "What is the capital of France?"},
+		{Role: RoleAssistant, Content: "The capital of France is Paris."},
+	}
+
+	proc, err := o.Spawn(agent, WithMessages(history))
+	if err != nil {
+		t.Fatalf("Spawn() returned error: %v", err)
+	}
+
+	// Verify messages were initialized
+	proc.mu.RLock()
+	if len(proc.messages) != 2 {
+		t.Errorf("Process should have 2 initial messages, got %d", len(proc.messages))
+	}
+	if proc.messages[0].Content != "What is the capital of France?" {
+		t.Errorf("First message content mismatch")
+	}
+	if proc.messages[1].Role != RoleAssistant {
+		t.Errorf("Second message role mismatch")
+	}
+	proc.mu.RUnlock()
+}
+
+func TestWithMessagesEmpty(t *testing.T) {
+	llm := &mockLLM{response: "Hello!"}
+	o := NewOrchestrator(WithLLM(llm))
+
+	agent := Agent{Name: "test"}
+	proc, err := o.Spawn(agent, WithMessages([]Message{}))
+	if err != nil {
+		t.Fatalf("Spawn() returned error: %v", err)
+	}
+
+	proc.mu.RLock()
+	if len(proc.messages) != 0 {
+		t.Errorf("Process should have 0 messages, got %d", len(proc.messages))
+	}
+	proc.mu.RUnlock()
+}
+
+func TestWithMessagesNil(t *testing.T) {
+	llm := &mockLLM{response: "Hello!"}
+	o := NewOrchestrator(WithLLM(llm))
+
+	agent := Agent{Name: "test"}
+	proc, err := o.Spawn(agent, WithMessages(nil))
+	if err != nil {
+		t.Fatalf("Spawn() returned error: %v", err)
+	}
+
+	// Should not panic and should have empty messages
+	proc.mu.RLock()
+	if proc.messages == nil {
+		t.Error("Process messages should be initialized, not nil")
+	}
+	proc.mu.RUnlock()
+}
+
+func TestWithMessagesCopiesSlice(t *testing.T) {
+	llm := &mockLLM{response: "Hello!"}
+	o := NewOrchestrator(WithLLM(llm))
+
+	agent := Agent{Name: "test"}
+	original := []Message{
+		{Role: RoleUser, Content: "Hello"},
+	}
+
+	proc, _ := o.Spawn(agent, WithMessages(original))
+
+	// Modify original slice
+	original[0].Content = "Modified"
+
+	// Process should have the original value
+	proc.mu.RLock()
+	if proc.messages[0].Content != "Hello" {
+		t.Error("WithMessages should copy the slice, not reference it")
+	}
+	proc.mu.RUnlock()
+}
