@@ -81,7 +81,10 @@ func (t *HTTPTransport) Send(ctx context.Context, method string, params any) (js
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, fmt.Errorf("http status %d (failed to read body: %v)", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("http status %d: %s", resp.StatusCode, string(body))
 	}
 

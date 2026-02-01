@@ -3,6 +3,8 @@ package vega
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -55,9 +57,6 @@ type Process struct {
 
 	// mutex for thread safety
 	mu sync.RWMutex
-
-	// result channel for async operations
-	resultCh chan *SendResult
 
 	// finalResult stores the result when process completes
 	finalResult string
@@ -293,7 +292,7 @@ func (p *Process) SendStream(ctx context.Context, message string) (*Stream, erro
 
 	// Create stream
 	stream := &Stream{
-		chunks: make(chan string, 100),
+		chunks: make(chan string, DefaultStreamBufferSize),
 		done:   make(chan struct{}),
 	}
 
@@ -460,7 +459,10 @@ func (p *Process) executeLLMLoop(ctx context.Context, message string) (string, C
 	}
 
 	// Main loop - keep calling LLM until we get a final response (no tool calls)
-	maxIterations := 50 // Safety limit
+	maxIterations := DefaultMaxIterations
+	if p.Agent.MaxIterations > 0 {
+		maxIterations = p.Agent.MaxIterations
+	}
 	for i := 0; i < maxIterations; i++ {
 		select {
 		case <-ctx.Done():
@@ -468,8 +470,8 @@ func (p *Process) executeLLMLoop(ctx context.Context, message string) (string, C
 		default:
 		}
 
-		// Call LLM
-		resp, err := p.llm.Generate(ctx, messages, toolSchemas)
+		// Call LLM with retry support
+		resp, err := p.callLLMWithRetry(ctx, messages, toolSchemas)
 		if err != nil {
 			return "", metrics, err
 		}
@@ -517,7 +519,10 @@ func (p *Process) executeLLMStream(ctx context.Context, message string, chunks c
 	}
 
 	var fullResponse string
-	maxIterations := 50 // Safety limit
+	maxIterations := DefaultMaxIterations
+	if p.Agent.MaxIterations > 0 {
+		maxIterations = p.Agent.MaxIterations
+	}
 
 	for i := 0; i < maxIterations; i++ {
 		select {
@@ -614,6 +619,126 @@ func (p *Process) executeLLMStream(ctx context.Context, message string, chunks c
 	return fullResponse, ErrMaxIterationsExceeded
 }
 
+// callLLMWithRetry calls the LLM with retry logic based on agent's RetryPolicy.
+func (p *Process) callLLMWithRetry(ctx context.Context, messages []Message, tools []ToolSchema) (*LLMResponse, error) {
+	policy := p.Agent.Retry
+	maxAttempts := 1
+	if policy != nil && policy.MaxAttempts > 0 {
+		maxAttempts = policy.MaxAttempts
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		start := time.Now()
+		resp, err := p.llm.Generate(ctx, messages, tools)
+		latency := time.Since(start)
+
+		if err == nil {
+			slog.Debug("llm call succeeded",
+				"process_id", p.ID,
+				"agent", p.Agent.Name,
+				"attempt", attempt+1,
+				"latency_ms", latency.Milliseconds(),
+				"input_tokens", resp.InputTokens,
+				"output_tokens", resp.OutputTokens,
+			)
+			return resp, nil
+		}
+
+		lastErr = err
+		errClass := ClassifyError(err)
+
+		slog.Warn("llm call failed",
+			"process_id", p.ID,
+			"agent", p.Agent.Name,
+			"attempt", attempt+1,
+			"max_attempts", maxAttempts,
+			"error", err.Error(),
+			"error_class", errClass,
+			"latency_ms", latency.Milliseconds(),
+		)
+
+		// Check if we should retry
+		if !ShouldRetry(err, policy, attempt) {
+			slog.Debug("not retrying",
+				"process_id", p.ID,
+				"reason", "retry policy",
+			)
+			return nil, err
+		}
+
+		// Calculate backoff delay
+		delay := p.calculateRetryDelay(policy, attempt)
+		if delay > 0 {
+			slog.Debug("retrying after backoff",
+				"process_id", p.ID,
+				"delay_ms", delay.Milliseconds(),
+			)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		// Update metrics
+		p.mu.Lock()
+		p.metrics.Errors++
+		p.mu.Unlock()
+	}
+
+	return nil, lastErr
+}
+
+// calculateRetryDelay computes the delay before the next retry attempt.
+func (p *Process) calculateRetryDelay(policy *RetryPolicy, attempt int) time.Duration {
+	if policy == nil || policy.Backoff.Initial == 0 {
+		return 0
+	}
+
+	var delay time.Duration
+	switch policy.Backoff.Type {
+	case BackoffExponential:
+		multiplier := policy.Backoff.Multiplier
+		if multiplier == 0 {
+			multiplier = 2.0
+		}
+		delay = time.Duration(float64(policy.Backoff.Initial) * pow64(multiplier, float64(attempt)))
+	case BackoffLinear:
+		delay = policy.Backoff.Initial * time.Duration(attempt+1)
+	case BackoffConstant:
+		delay = policy.Backoff.Initial
+	default:
+		delay = policy.Backoff.Initial
+	}
+
+	// Apply max limit
+	if policy.Backoff.Max > 0 && delay > policy.Backoff.Max {
+		delay = policy.Backoff.Max
+	}
+
+	// Apply jitter if configured
+	if policy.Backoff.Jitter > 0 {
+		jitterRange := float64(delay) * policy.Backoff.Jitter
+		jitter := (rand.Float64()*2 - 1) * jitterRange // -jitter to +jitter
+		delay = time.Duration(float64(delay) + jitter)
+		if delay < 0 {
+			delay = 0
+		}
+	}
+
+	return delay
+}
+
+// pow64 is a simple power function for floats.
+func pow64(base, exp float64) float64 {
+	result := 1.0
+	for i := 0; i < int(exp); i++ {
+		result *= base
+	}
+	return result
+}
+
 // buildMessages builds the message list for LLM call.
 func (p *Process) buildMessages() []Message {
 	var messages []Message
@@ -643,7 +768,7 @@ func (p *Process) buildMessages() []Message {
 
 	// Add conversation history
 	if p.Agent.Context != nil {
-		maxTokens := 100000 // Default, could be configurable
+		maxTokens := DefaultMaxContextTokens
 		if p.Agent.MaxTokens > 0 {
 			maxTokens = p.Agent.MaxTokens
 		}

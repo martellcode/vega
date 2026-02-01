@@ -1,14 +1,21 @@
 package vega
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"text/template"
+	"time"
 
 	"github.com/martellcode/vega/container"
 	"gopkg.in/yaml.v3"
@@ -111,6 +118,9 @@ func WithContainerRouting(tools ...string) ToolsOption {
 	}
 }
 
+// ErrToolAlreadyRegistered is returned when trying to register a duplicate tool name.
+var ErrToolAlreadyRegistered = errors.New("tool already registered")
+
 // Register adds a tool to the collection.
 // The function can be:
 // - func(params) string
@@ -118,8 +128,17 @@ func WithContainerRouting(tools ...string) ToolsOption {
 // - func(ctx, params) (string, error)
 // - ToolDef with explicit schema
 func (t *Tools) Register(name string, fn any) error {
+	if name == "" {
+		return errors.New("tool name is required")
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// Check for duplicate registration
+	if _, exists := t.tools[name]; exists {
+		return fmt.Errorf("%w: %s", ErrToolAlreadyRegistered, name)
+	}
 
 	tl := &tool{
 		name: name,
@@ -631,20 +650,241 @@ func goTypeToJSONType(t reflect.Type) string {
 	}
 }
 
-// HTTP executor (placeholder - needs net/http implementation)
+// HTTP executor with template interpolation support.
 func (t *Tools) createHTTPExecutor(impl DynamicToolImpl) ToolFunc {
 	return func(ctx context.Context, params map[string]any) (string, error) {
-		// TODO: Implement HTTP execution with template interpolation
-		return "", fmt.Errorf("HTTP executor not implemented")
+		// Parse timeout
+		timeout := 30 * time.Second
+		if impl.Timeout != "" {
+			if d, err := time.ParseDuration(impl.Timeout); err == nil {
+				timeout = d
+			}
+		}
+
+		// Create context with timeout
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		// Interpolate URL with params
+		url, err := interpolateTemplate(impl.URL, params)
+		if err != nil {
+			return "", fmt.Errorf("interpolate URL: %w", err)
+		}
+
+		// Determine method (default GET)
+		method := impl.Method
+		if method == "" {
+			method = "GET"
+		}
+		method = strings.ToUpper(method)
+
+		// Build request body if present
+		var bodyReader io.Reader
+		if impl.Body != nil {
+			// Handle body as template string or map
+			switch body := impl.Body.(type) {
+			case string:
+				interpolated, err := interpolateTemplate(body, params)
+				if err != nil {
+					return "", fmt.Errorf("interpolate body: %w", err)
+				}
+				bodyReader = strings.NewReader(interpolated)
+			case map[string]any:
+				// Interpolate map values
+				interpolatedMap := make(map[string]any)
+				for k, v := range body {
+					if s, ok := v.(string); ok {
+						interpolated, err := interpolateTemplate(s, params)
+						if err != nil {
+							return "", fmt.Errorf("interpolate body field %s: %w", k, err)
+						}
+						interpolatedMap[k] = interpolated
+					} else {
+						interpolatedMap[k] = v
+					}
+				}
+				jsonBody, err := json.Marshal(interpolatedMap)
+				if err != nil {
+					return "", fmt.Errorf("marshal body: %w", err)
+				}
+				bodyReader = bytes.NewReader(jsonBody)
+			default:
+				jsonBody, err := json.Marshal(body)
+				if err != nil {
+					return "", fmt.Errorf("marshal body: %w", err)
+				}
+				bodyReader = bytes.NewReader(jsonBody)
+			}
+		}
+
+		// Create request
+		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		if err != nil {
+			return "", fmt.Errorf("create request: %w", err)
+		}
+
+		// Set headers
+		for k, v := range impl.Headers {
+			interpolated, err := interpolateTemplate(v, params)
+			if err != nil {
+				return "", fmt.Errorf("interpolate header %s: %w", k, err)
+			}
+			req.Header.Set(k, interpolated)
+		}
+
+		// Set default content type for JSON body
+		if bodyReader != nil && req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		// Add query parameters
+		if len(impl.Query) > 0 {
+			q := req.URL.Query()
+			for k, v := range impl.Query {
+				interpolated, err := interpolateTemplate(v, params)
+				if err != nil {
+					return "", fmt.Errorf("interpolate query %s: %w", k, err)
+				}
+				q.Set(k, interpolated)
+			}
+			req.URL.RawQuery = q.Encode()
+		}
+
+		// Execute request
+		client := &http.Client{Timeout: timeout}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("http request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		// Read response
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("read response: %w", err)
+		}
+
+		// Check status
+		if resp.StatusCode >= 400 {
+			return "", fmt.Errorf("http error %d: %s", resp.StatusCode, string(body))
+		}
+
+		return string(body), nil
 	}
 }
 
-// Exec executor (placeholder - needs os/exec implementation)
+// Exec executor with template interpolation support.
 func (t *Tools) createExecExecutor(impl DynamicToolImpl) ToolFunc {
 	return func(ctx context.Context, params map[string]any) (string, error) {
-		// TODO: Implement command execution with template interpolation
-		return "", fmt.Errorf("exec executor not implemented")
+		// Parse timeout
+		timeout := 30 * time.Second
+		if impl.Timeout != "" {
+			if d, err := time.ParseDuration(impl.Timeout); err == nil {
+				timeout = d
+			}
+		}
+
+		// Create context with timeout
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		// Interpolate command with params
+		command, err := interpolateTemplate(impl.Command, params)
+		if err != nil {
+			return "", fmt.Errorf("interpolate command: %w", err)
+		}
+
+		// Parse command into parts (simple shell-like parsing)
+		cmdParts := parseCommand(command)
+		if len(cmdParts) == 0 {
+			return "", fmt.Errorf("empty command")
+		}
+
+		// Create command
+		cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+
+		// Capture output
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		// Set working directory if specified in params
+		if workDir, ok := params["work_dir"].(string); ok && workDir != "" {
+			cmd.Dir = workDir
+		}
+
+		// Run command
+		err = cmd.Run()
+		output := stdout.String()
+		if stderr.Len() > 0 {
+			if output != "" {
+				output += "\n"
+			}
+			output += stderr.String()
+		}
+
+		if err != nil {
+			return output, fmt.Errorf("command failed: %w", err)
+		}
+
+		return output, nil
 	}
+}
+
+// interpolateTemplate replaces {{.field}} placeholders with values from params.
+func interpolateTemplate(tmplStr string, params map[string]any) (string, error) {
+	// Quick check if interpolation is needed
+	if !strings.Contains(tmplStr, "{{") {
+		return tmplStr, nil
+	}
+
+	tmpl, err := template.New("").Parse(tmplStr)
+	if err != nil {
+		return "", err
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, params); err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
+}
+
+// parseCommand splits a command string into parts, respecting quotes.
+func parseCommand(cmd string) []string {
+	var parts []string
+	var current strings.Builder
+	inQuote := false
+	quoteChar := rune(0)
+
+	for _, r := range cmd {
+		switch {
+		case r == '"' || r == '\'':
+			if !inQuote {
+				inQuote = true
+				quoteChar = r
+			} else if r == quoteChar {
+				inQuote = false
+				quoteChar = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == ' ' && !inQuote:
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+
+	return parts
 }
 
 // File read executor

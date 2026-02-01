@@ -1,6 +1,10 @@
 package vega
 
-import "errors"
+import (
+	"errors"
+	"net/http"
+	"strings"
+)
 
 // Standard errors
 var (
@@ -98,4 +102,140 @@ func (e *ValidationError) Error() string {
 		return e.Field + " at line " + string(rune(e.Line)) + ": " + e.Message
 	}
 	return e.Field + ": " + e.Message
+}
+
+// APIError represents an error from an API call with status information.
+type APIError struct {
+	StatusCode int
+	Message    string
+	Err        error
+}
+
+func (e *APIError) Error() string {
+	if e.Err != nil {
+		return e.Message + ": " + e.Err.Error()
+	}
+	return e.Message
+}
+
+func (e *APIError) Unwrap() error {
+	return e.Err
+}
+
+// ClassifyError determines the ErrorClass for an error.
+// This enables intelligent retry decisions based on error type.
+func ClassifyError(err error) ErrorClass {
+	if err == nil {
+		return ErrClassTemporary
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// Check for API errors with status codes
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return classifyStatusCode(apiErr.StatusCode)
+	}
+
+	// Check for rate limiting indicators
+	if strings.Contains(errStr, "rate limit") ||
+		strings.Contains(errStr, "rate_limit") ||
+		strings.Contains(errStr, "too many requests") ||
+		strings.Contains(errStr, "429") {
+		return ErrClassRateLimit
+	}
+
+	// Check for overloaded/capacity indicators
+	if strings.Contains(errStr, "overloaded") ||
+		strings.Contains(errStr, "capacity") ||
+		strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "service unavailable") {
+		return ErrClassOverloaded
+	}
+
+	// Check for timeout indicators
+	if strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "deadline exceeded") ||
+		strings.Contains(errStr, "context canceled") {
+		return ErrClassTimeout
+	}
+
+	// Check for authentication errors
+	if strings.Contains(errStr, "unauthorized") ||
+		strings.Contains(errStr, "authentication") ||
+		strings.Contains(errStr, "invalid api key") ||
+		strings.Contains(errStr, "401") {
+		return ErrClassAuthentication
+	}
+
+	// Check for invalid request errors
+	if strings.Contains(errStr, "invalid") ||
+		strings.Contains(errStr, "bad request") ||
+		strings.Contains(errStr, "400") ||
+		strings.Contains(errStr, "validation") {
+		return ErrClassInvalidRequest
+	}
+
+	// Check for budget exceeded
+	if errors.Is(err, ErrBudgetExceeded) {
+		return ErrClassBudgetExceeded
+	}
+
+	// Default to temporary (potentially retryable)
+	return ErrClassTemporary
+}
+
+// classifyStatusCode maps HTTP status codes to ErrorClass.
+func classifyStatusCode(code int) ErrorClass {
+	switch code {
+	case http.StatusTooManyRequests:
+		return ErrClassRateLimit
+	case http.StatusServiceUnavailable:
+		return ErrClassOverloaded
+	case http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		return ErrClassTimeout
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return ErrClassAuthentication
+	case http.StatusBadRequest:
+		return ErrClassInvalidRequest
+	default:
+		if code >= 500 {
+			return ErrClassTemporary
+		}
+		return ErrClassInvalidRequest
+	}
+}
+
+// IsRetryable returns true if the error class should typically be retried.
+func IsRetryable(class ErrorClass) bool {
+	switch class {
+	case ErrClassRateLimit, ErrClassOverloaded, ErrClassTimeout, ErrClassTemporary:
+		return true
+	case ErrClassInvalidRequest, ErrClassAuthentication, ErrClassBudgetExceeded:
+		return false
+	default:
+		return false
+	}
+}
+
+// ShouldRetry checks if an error should be retried based on the retry policy.
+func ShouldRetry(err error, policy *RetryPolicy, attempt int) bool {
+	if policy == nil || attempt >= policy.MaxAttempts {
+		return false
+	}
+
+	class := ClassifyError(err)
+
+	// If RetryOn is specified, only retry those classes
+	if len(policy.RetryOn) > 0 {
+		for _, retryClass := range policy.RetryOn {
+			if retryClass == class {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Default: retry anything that's retryable
+	return IsRetryable(class)
 }

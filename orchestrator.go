@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -248,6 +249,11 @@ func WithProject(name string) SpawnOption {
 
 // Spawn creates and starts a new process from an agent.
 func (o *Orchestrator) Spawn(agent Agent, opts ...SpawnOption) (*Process, error) {
+	// Validate agent
+	if agent.Name == "" {
+		return nil, &ProcessError{Err: errors.New("agent name is required")}
+	}
+
 	o.mu.Lock()
 
 	// Check capacity
@@ -298,6 +304,12 @@ func (o *Orchestrator) Spawn(agent Agent, opts ...SpawnOption) (*Process, error)
 	p.mu.Lock()
 	p.status = StatusRunning
 	p.mu.Unlock()
+
+	slog.Info("process spawned",
+		"process_id", p.ID,
+		"agent", agent.Name,
+		"task", p.Task,
+	)
 
 	// Emit started event
 	o.emitStarted(p)
@@ -431,42 +443,78 @@ func (o *Orchestrator) OnProcessStarted(fn func(*Process)) {
 
 // emitComplete notifies all complete callbacks.
 func (o *Orchestrator) emitComplete(p *Process, result string) {
-	// Unregister name if process was named
-	if name := p.Name(); name != "" {
-		o.Unregister(name)
+	agentName := ""
+	if p.Agent != nil {
+		agentName = p.Agent.Name
 	}
 
-	// Leave all groups
-	o.LeaveAllGroups(p)
+	slog.Info("process completed",
+		"process_id", p.ID,
+		"agent", agentName,
+		"result_length", len(result),
+	)
 
 	o.callbackMu.RLock()
 	callbacks := make([]func(*Process, string), len(o.onComplete))
 	copy(callbacks, o.onComplete)
 	o.callbackMu.RUnlock()
 
+	// Run callbacks synchronously first so they can access the process by name
+	var wg sync.WaitGroup
 	for _, fn := range callbacks {
-		go fn(p, result)
+		wg.Add(1)
+		go func(f func(*Process, string)) {
+			defer wg.Done()
+			f(p, result)
+		}(fn)
 	}
-}
+	wg.Wait()
 
-// emitFailed notifies all failed callbacks.
-func (o *Orchestrator) emitFailed(p *Process, err error) {
-	// Unregister name if process was named
+	// Unregister name AFTER callbacks complete
 	if name := p.Name(); name != "" {
 		o.Unregister(name)
 	}
 
 	// Leave all groups
 	o.LeaveAllGroups(p)
+}
+
+// emitFailed notifies all failed callbacks.
+func (o *Orchestrator) emitFailed(p *Process, err error) {
+	agentName := ""
+	if p.Agent != nil {
+		agentName = p.Agent.Name
+	}
+
+	slog.Error("process failed",
+		"process_id", p.ID,
+		"agent", agentName,
+		"error", err.Error(),
+	)
 
 	o.callbackMu.RLock()
 	callbacks := make([]func(*Process, error), len(o.onFailed))
 	copy(callbacks, o.onFailed)
 	o.callbackMu.RUnlock()
 
+	// Run callbacks synchronously first so they can access the process by name
+	var wg sync.WaitGroup
 	for _, fn := range callbacks {
-		go fn(p, err)
+		wg.Add(1)
+		go func(f func(*Process, error)) {
+			defer wg.Done()
+			f(p, err)
+		}(fn)
 	}
+	wg.Wait()
+
+	// Unregister name AFTER callbacks complete
+	if name := p.Name(); name != "" {
+		o.Unregister(name)
+	}
+
+	// Leave all groups
+	o.LeaveAllGroups(p)
 
 	// Handle automatic restart if configured
 	go o.handleAutoRestart(p, err)
@@ -874,7 +922,7 @@ func (s *Supervisor) monitorChild(child *supervisedChild) {
 			select {
 			case <-s.ctx.Done():
 				return
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(DefaultSupervisorPollInterval):
 				status := proc.Status()
 				if status == StatusCompleted || status == StatusFailed {
 					s.handleChildExit(child, status)

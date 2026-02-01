@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -111,8 +112,17 @@ func (t *StdioTransport) Send(ctx context.Context, method string, params any) (j
 
 	defer func() {
 		t.pendingMu.Lock()
+		ch := t.pending[id]
 		delete(t.pending, id)
 		t.pendingMu.Unlock()
+		// Close channel to prevent goroutine leaks if response arrives after cleanup
+		if ch != nil {
+			// Drain channel if needed
+			select {
+			case <-ch:
+			default:
+			}
+		}
 	}()
 
 	// Send request
@@ -227,11 +237,16 @@ func (t *StdioTransport) readLoop() {
 	t.pendingMu.Unlock()
 }
 
-// readStderr reads stderr for debugging.
+// readStderr reads stderr and logs it for debugging.
 func (t *StdioTransport) readStderr() {
 	scanner := bufio.NewScanner(t.stderr)
 	for scanner.Scan() {
-		// Could log this somewhere for debugging
-		_ = scanner.Text()
+		line := scanner.Text()
+		if line != "" {
+			slog.Debug("mcp server stderr",
+				"server", t.config.Name,
+				"line", line,
+			)
+		}
 	}
 }

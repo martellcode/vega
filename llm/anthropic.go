@@ -55,15 +55,22 @@ func WithHTTPClient(client *http.Client) AnthropicOption {
 	}
 }
 
+// Default Anthropic configuration values
+const (
+	DefaultAnthropicTimeout = 5 * time.Minute
+	DefaultAnthropicModel   = "claude-sonnet-4-20250514"
+	DefaultAnthropicBaseURL = "https://api.anthropic.com"
+)
+
 // NewAnthropic creates a new Anthropic LLM client.
 func NewAnthropic(opts ...AnthropicOption) *AnthropicLLM {
 	a := &AnthropicLLM{
 		apiKey:  os.Getenv("ANTHROPIC_API_KEY"),
-		baseURL: "https://api.anthropic.com",
+		baseURL: DefaultAnthropicBaseURL,
 		httpClient: &http.Client{
-			Timeout: 5 * time.Minute,
+			Timeout: DefaultAnthropicTimeout,
 		},
-		model: "claude-sonnet-4-20250514",
+		model: DefaultAnthropicModel,
 	}
 
 	for _, opt := range opts {
@@ -162,7 +169,14 @@ func (a *AnthropicLLM) GenerateStream(ctx context.Context, messages []vega.Messa
 		defer httpResp.Body.Close()
 
 		if httpResp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(httpResp.Body)
+			body, readErr := io.ReadAll(httpResp.Body)
+			if readErr != nil {
+				eventCh <- vega.StreamEvent{
+					Type:  vega.StreamEventError,
+					Error: fmt.Errorf("API error %d (failed to read body: %v)", httpResp.StatusCode, readErr),
+				}
+				return
+			}
 			eventCh <- vega.StreamEvent{
 				Type:  vega.StreamEventError,
 				Error: fmt.Errorf("API error %d: %s", httpResp.StatusCode, string(body)),
