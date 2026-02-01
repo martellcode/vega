@@ -84,6 +84,9 @@ type Process struct {
 	// Automatic restart support
 	restartPolicy ChildRestart
 	spawnOpts     []SpawnOption
+
+	// Process group membership
+	groups map[string]*ProcessGroup
 }
 
 // Status represents the process lifecycle state.
@@ -190,6 +193,18 @@ func (p *Process) Name() string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.name
+}
+
+// Groups returns the names of all groups this process belongs to.
+func (p *Process) Groups() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	names := make([]string, 0, len(p.groups))
+	for name := range p.groups {
+		names = append(names, name)
+	}
+	return names
 }
 
 // Send sends a message and waits for a response.

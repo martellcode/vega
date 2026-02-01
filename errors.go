@@ -51,6 +51,9 @@ var (
 
 	// ErrNameTaken is returned when trying to register a name that's already in use
 	ErrNameTaken = errors.New("name already registered")
+
+	// ErrGroupNotFound is returned when a process group doesn't exist
+	ErrGroupNotFound = errors.New("process group not found")
 )
 
 // ProcessError wraps errors with process context.
